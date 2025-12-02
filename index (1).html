@@ -1,0 +1,603 @@
+
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+    getAuth, 
+    signInAnonymously, 
+    signInWithCustomToken, 
+    onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+    getFirestore, 
+    collection, 
+    addDoc, 
+    query, 
+    onSnapshot, 
+    Timestamp,
+    setLogLevel,
+    doc,
+    updateDoc,
+    deleteDoc
+} from 'firebase/firestore';
+
+// Set Firebase logging level (useful for debugging)
+setLogLevel('debug');
+
+// --- Global Variables Provided by Environment ---
+// NOTE: When deploying to Replit/Glitch, you will replace these with actual values from your Firebase Project Settings.
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// =================================================================
+// 🚨 ADMIN CONFIGURATION 🚨
+// 🛑 USER'S FULL UID HAS BEEN PASTED HERE to enable Admin Access 
+const ADMIN_USER_ID = '12711172378747151863'; 
+// =================================================================
+
+// Mock data for categories and countries
+const CATEGORIES = [
+    'Select Category', '18+', 'Adult', 'Advertising', 'Animation', 
+    'App Development', 'Art', 'Business', 'Education', 'Gaming', 'News', 
+    'Movies', 'Music', 'Sports', 'Technology', 'Travel'
+];
+const COUNTRIES = [
+    'Select Country', 'Global', 'India', 'USA', 'Pakistan', 
+    'Brazil', 'Indonesia', 'UK', 'Nigeria', 'Egypt', 'Germany', 'Australia'
+];
+
+// Helper to sanitize and validate WhatsApp link structure
+const sanitizeLink = (link) => {
+    if (!link) return '';
+    const trimmed = link.trim();
+    if (trimmed.startsWith('https://chat.whatsapp.com/') || trimmed.startsWith('https://whatsapp.com/channel/')) {
+        return trimmed;
+    }
+    if (trimmed.startsWith('chat.whatsapp.com/') || trimmed.startsWith('whatsapp.com/channel/')) {
+        return 'https://' + trimmed;
+    }
+    return '';
+};
+
+// Custom Hook for Copy to Clipboard functionality
+const useCopyToClipboard = (text) => {
+    const [isCopied, setIsCopied] = useState(false);
+
+    const copy = useCallback(() => {
+        if (!text) return;
+        try {
+            // Using execCommand for wider compatibility in iFrames
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+            setIsCopied(true);
+            setTimeout(() => setIsCopied(false), 2000);
+        } catch (err) {
+            console.error('Failed to copy text: ', err);
+            setIsCopied(false);
+        }
+    }, [text]);
+
+    return { copy, isCopied };
+};
+
+
+// --- Group Modal Component (Handles Add and Edit) ---
+const GroupFormModal = ({ db, userId, publicCollectionPath, onClose, isVisible, groupToEdit }) => {
+    const isEditing = !!groupToEdit;
+    const initialFormState = useMemo(() => ({ 
+        link: groupToEdit?.link || '', 
+        category: groupToEdit?.category || CATEGORIES[0], 
+        country: groupToEdit?.country || COUNTRIES[0], 
+        tags: groupToEdit?.tags?.join(', ') || '', 
+        description: groupToEdit?.description || '' 
+    }), [groupToEdit]);
+
+    const [formState, setFormState] = useState(initialFormState);
+    const [submitStatus, setSubmitStatus] = useState({ message: '', type: '' });
+    const [isSubmitting, setIsSubmitting] = useState(false);
+
+    // Reset form state when the modal opens/closes or groupToEdit changes
+    useEffect(() => {
+        if (isVisible) {
+            setFormState(initialFormState);
+            setSubmitStatus({ message: '', type: '' });
+        }
+    }, [isVisible, initialFormState]);
+
+    const handleFormChange = (e) => {
+        setFormState({ ...formState, [e.target.name]: e.target.value });
+        setSubmitStatus({ message: '', type: '' });
+    };
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (!db || !userId) {
+            setSubmitStatus({ message: "App not authenticated yet.", type: 'error' });
+            return;
+        }
+
+        const { link, category, country, tags, description } = formState;
+        const validatedLink = sanitizeLink(link);
+
+        if (!validatedLink || category === CATEGORIES[0] || country === COUNTRIES[0]) {
+            setSubmitStatus({ message: "Please fill all required fields and ensure the link is valid.", type: 'error' });
+            return;
+        }
+        
+        setIsSubmitting(true);
+
+        const groupData = {
+            link: validatedLink,
+            category,
+            country,
+            tags: tags.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0),
+            description: description.trim(),
+        };
+
+        try {
+            if (isEditing) {
+                const groupDocRef = doc(db, publicCollectionPath, groupToEdit.id);
+                // Admin can update all fields
+                await updateDoc(groupDocRef, groupData);
+                setSubmitStatus({ message: "Group updated successfully!", type: 'success' });
+            } else {
+                const groupsCollectionRef = collection(db, publicCollectionPath);
+                await addDoc(groupsCollectionRef, {
+                    ...groupData,
+                    createdBy: userId,
+                    createdAt: Timestamp.now(),
+                });
+                setFormState(initialFormState); // Clear form after submission
+                setSubmitStatus({ message: "Group added successfully!", type: 'success' });
+            }
+
+            // Auto close after success
+            setTimeout(onClose, 1500); 
+
+        } catch (error) {
+            console.error(`Error ${isEditing ? 'updating' : 'adding'} document: `, error);
+            setSubmitStatus({ message: `Failed to ${isEditing ? 'update' : 'add'} group.`, type: 'error' });
+        } finally {
+            setIsSubmitting(false);
+        }
+    };
+
+    if (!isVisible) return null;
+
+    return (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-80 flex justify-center items-start pt-10 overflow-y-auto">
+            <div className="bg-gray-900 w-full max-w-md mx-4 p-6 rounded-xl shadow-2xl border border-green-700">
+                <div className="flex justify-between items-center mb-6">
+                    <h2 className="text-2xl font-bold text-green-400">
+                        {isEditing ? 'Edit Group/Channel' : 'Add WhatsApp Group/Channel'}
+                    </h2>
+                    <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                    </button>
+                </div>
+
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    
+                    {submitStatus.message && (
+                        <div className={`p-3 rounded-lg font-medium text-sm ${submitStatus.type === 'error' ? 'bg-red-900 text-red-300' : 'bg-green-900 text-green-300'}`}>
+                            {submitStatus.message}
+                        </div>
+                    )}
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-300 mb-1">Group or Channel Link <span className="text-red-500">*</span></label>
+                        <input
+                            type="url"
+                            name="link"
+                            value={formState.link}
+                            onChange={handleFormChange}
+                            placeholder="https://chat.whatsapp.com/... or https://whatsapp.com/channel/..."
+                            className="w-full p-3 rounded-lg bg-gray-800 border border-gray-700 text-white focus:ring-green-500 focus:border-green-500"
+                            required
+                            disabled={isEditing && !ADMIN_USER_ID} // Only admin can change link on edit, but for simplicity we keep it static
+                        />
+                         {isEditing && <p className="text-xs text-gray-500 mt-1">Link cannot be changed after creation.</p>}
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-300 mb-1">Category <span className="text-red-500">*</span></label>
+                        <select
+                            name="category"
+                            value={formState.category}
+                            onChange={handleFormChange}
+                            className="w-full p-3 rounded-lg bg-gray-800 border border-gray-700 text-white focus:ring-green-500 focus:border-green-500"
+                            required
+                        >
+                            {CATEGORIES.map(c => <option key={c} value={c} disabled={c === CATEGORIES[0]}>{c}</option>)}
+                        </select>
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-300 mb-1">Country <span className="text-red-500">*</span></label>
+                        <select
+                            name="country"
+                            value={formState.country}
+                            onChange={handleFormChange}
+                            className="w-full p-3 rounded-lg bg-gray-800 border border-gray-700 text-white focus:ring-green-500 focus:border-green-500"
+                            required
+                        >
+                            {COUNTRIES.map(c => <option key={c} value={c} disabled={c === COUNTRIES[0]}>{c}</option>)}
+                        </select>
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-300 mb-1">Tags (comma-separated, e.g., coding, jobs)</label>
+                        <input
+                            type="text"
+                            name="tags"
+                            value={formState.tags}
+                            onChange={handleFormChange}
+                            placeholder="e.g., tech, ai, news"
+                            className="w-full p-3 rounded-lg bg-gray-800 border border-gray-700 text-white focus:ring-green-500 focus:border-green-500"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-300 mb-1">Description (Optional, 100 char max)</label>
+                        <textarea
+                            name="description"
+                            value={formState.description}
+                            onChange={handleFormChange}
+                            rows="3"
+                            maxLength="100"
+                            placeholder="Briefly describe the group rules or focus."
+                            className="w-full p-3 rounded-lg bg-gray-800 border border-gray-700 text-white focus:ring-green-500 focus:border-green-500 resize-none"
+                        />
+                    </div>
+
+                    <button
+                        type="submit"
+                        className="w-full py-3 px-4 bg-green-600 text-white font-bold rounded-lg shadow-xl hover:bg-green-700 transition duration-150 transform hover:scale-[1.01]"
+                        disabled={isSubmitting || !userId}
+                    >
+                        {isSubmitting ? "Processing..." : (isEditing ? "Save Changes" : "Submit Group")}
+                    </button>
+                </form>
+            </div>
+        </div>
+    );
+};
+
+
+// --- Main Application Component ---
+const App = () => {
+    const [db, setDb] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [allGroups, setAllGroups] = useState([]);
+    const [filter, setFilter] = useState({ category: CATEGORIES[0], country: COUNTRIES[0] });
+    const [isLoading, setIsLoading] = useState(true);
+    
+    // State for Modal Management
+    const [isModalOpen, setIsModalOpen] = useState(false);
+    const [editingGroup, setEditingGroup] = useState(null); // Group object if editing, null if adding
+
+    // Determine Admin status
+    const isAdmin = userId === ADMIN_USER_ID;
+
+    // Hook to copy the full user ID
+    const { copy, isCopied } = useCopyToClipboard(userId);
+    
+    // 1. Firebase Initialization & Auth
+    useEffect(() => {
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestore = getFirestore(app);
+            const authInstance = getAuth(app);
+            
+            setDb(firestore);
+
+            const authenticate = async () => {
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(authInstance, initialAuthToken);
+                    } else {
+                        await signInAnonymously(authInstance);
+                    }
+                } catch (error) {
+                    console.error("Firebase Auth Error:", error);
+                }
+            };
+
+            authenticate();
+
+            const unsubscribe = onAuthStateChanged(authInstance, (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    setUserId(null);
+                }
+                setIsLoading(false);
+            });
+
+            return () => unsubscribe();
+        } catch (error) {
+            console.error("Firebase Initialization Error:", error);
+            setIsLoading(false);
+        }
+    }, []);
+
+    const publicCollectionPath = useMemo(() => {
+        if (!appId) return null;
+        return `artifacts/${appId}/public/data/whatsapp_groups_advanced`;
+    }, [appId]);
+
+    // 2. Real-time Data Fetching
+    useEffect(() => {
+        if (!db || !userId || !publicCollectionPath) return;
+
+        const groupsCollectionRef = collection(db, publicCollectionPath);
+        const q = query(groupsCollectionRef);
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const groupsList = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data(),
+                timestamp: doc.data().createdAt ? doc.data().createdAt.toDate().toLocaleDateString('en-US') : 'N/A'
+            }));
+            
+            // Sort by creation date, newest first
+            groupsList.sort((a, b) => new Date(b.createdAt?.toDate() || 0) - new Date(a.createdAt?.toDate() || 0));
+
+            setAllGroups(groupsList);
+        }, (error) => {
+            console.error("Firestore Snapshot Error:", error);
+        });
+
+        return () => unsubscribe();
+    }, [db, userId, publicCollectionPath]);
+
+    // 3. Filtering Logic
+    const filteredGroups = useMemo(() => {
+        let list = allGroups;
+        
+        const categoryFilter = filter.category;
+        const countryFilter = filter.country;
+
+        if (categoryFilter !== CATEGORIES[0]) {
+            list = list.filter(group => group.category === categoryFilter);
+        }
+
+        if (countryFilter !== COUNTRIES[0]) {
+            list = list.filter(group => group.country === countryFilter);
+        }
+
+        return list;
+    }, [allGroups, filter]);
+
+    // 4. Admin Actions
+    const handleEdit = (group) => {
+        // Admin user can edit
+        if (!isAdmin) return; 
+        setEditingGroup(group);
+        setIsModalOpen(true);
+    };
+
+    const handleDelete = async (groupId) => {
+        // Admin user can delete
+        if (!isAdmin || !db || !window.confirm("Are you sure you want to delete this group? This action is permanent.")) return;
+
+        try {
+            const groupDocRef = doc(db, publicCollectionPath, groupId);
+            await deleteDoc(groupDocRef);
+            console.log("Document successfully deleted!");
+        } catch (error) {
+            console.error("Error removing document: ", error);
+        }
+    };
+
+    // Modal Close Handler
+    const handleModalClose = () => {
+        setIsModalOpen(false);
+        setEditingGroup(null);
+    }
+
+
+    // Loading State
+    if (isLoading) {
+        return (
+            <div className="flex justify-center items-center h-screen bg-gray-900">
+                <div className="text-xl font-semibold text-green-500">Loading Application...</div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-gray-900 text-white">
+            <header className="sticky top-0 z-40 bg-gray-800 shadow-xl p-4">
+                <div className="max-w-4xl mx-auto">
+                    <div className="flex justify-between items-center">
+                        <h1 className="text-2xl font-extrabold text-green-400">GroupsOP <span className="text-sm text-gray-400">Directory</span></h1>
+                        
+                        {/* Admin Status Indicator */}
+                        {isAdmin && (
+                            <span className="text-sm font-bold bg-red-600 text-white px-3 py-1 rounded-full shadow-lg">
+                                ADMIN ACCESS
+                            </span>
+                        )}
+
+                        {/* Mobile menu icon placeholder */}
+                        <button className="text-gray-300 hover:text-white md:hidden">
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" /></svg>
+                        </button>
+                    </div>
+                </div>
+            </header>
+
+            <main className="max-w-4xl mx-auto p-4">
+                
+                {/* User ID display and Copy Button (STEP 2) */}
+                <div className="text-xs mt-2 mb-4 p-2 bg-gray-800 text-gray-400 rounded-lg shadow-inner">
+                    <p className="mb-1 font-bold text-gray-300">Your Authentication ID (UID):</p>
+                    <div className="flex items-center justify-between">
+                        <span className="font-mono text-sm break-all text-yellow-300 pr-2">{userId || 'N/A'}</span>
+                        <button 
+                            onClick={copy}
+                            className={`flex items-center px-3 py-1 text-xs font-semibold rounded-md transition duration-150 ${
+                                isCopied ? 'bg-green-600 text-white' : 'bg-green-500 hover:bg-green-600 text-gray-900'
+                            }`}
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m-3 7v1a2 2 0 01-2 2H6a2 2 0 01-2-2v-1m10-4a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                            {isCopied ? 'Copied!' : 'Copy ID'}
+                        </button>
+                    </div>
+                    {/* Informational message updated after setting the Admin ID */}
+                    <p className="text-green-300 mt-1">✅ Admin ID is set in the code to grant you access.</p>
+                </div>
+
+                {/* Add Group Button */}
+                <button 
+                    onClick={() => { setIsModalOpen(true); setEditingGroup(null); }}
+                    className="w-full py-3 mb-6 bg-green-600 text-white font-bold rounded-lg shadow-lg hover:bg-green-700 transition duration-200 transform hover:scale-[1.01]"
+                >
+                    + Add WhatsApp Group or Channel
+                </button>
+
+                {/* Video Placeholder */}
+                <div className="bg-gray-700 rounded-xl overflow-hidden mb-8 shadow-xl">
+                    <div className="relative pt-[56.25%]"> {/* 16:9 Aspect Ratio */}
+                        <img 
+                            src="https://placehold.co/800x450/16a34a/ffffff?text=What+Is+GroupsOP%3F+Watch+Video" 
+                            alt="Video Placeholder" 
+                            className="absolute inset-0 w-full h-full object-cover"
+                        />
+                        <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-30">
+                            <svg className="w-16 h-16 text-red-500 cursor-pointer" fill="currentColor" viewBox="0 0 24 24"><path d="M21 12l-18 9v-18l18 9z"/></svg>
+                        </div>
+                        <div className="absolute bottom-2 right-2 bg-black text-white px-2 py-1 text-sm rounded-lg opacity-80">
+                            Video Guide
+                        </div>
+                    </div>
+                </div>
+
+
+                {/* Filter Section */}
+                <div className="bg-gray-800 p-4 rounded-xl shadow-lg mb-8">
+                    <h2 className="text-xl font-bold text-gray-200 mb-4">Filter Groups</h2>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                        <select 
+                            value={filter.category} 
+                            onChange={(e) => setFilter({...filter, category: e.target.value})}
+                            className="p-3 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-green-500 focus:border-green-500"
+                        >
+                            {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                        <select 
+                            value={filter.country} 
+                            onChange={(e) => setFilter({...filter, country: e.target.value})}
+                            className="p-3 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-green-500 focus:border-green-500"
+                        >
+                            COUNTRIES.map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                        <button className="p-3 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 transition duration-150">
+                            Apply Filters
+                        </button>
+                    </div>
+                </div>
+
+
+                {/* Group Listing */}
+                <h2 className="text-2xl font-bold text-green-400 mb-6">Browse WhatsApp Group or Channels ({filteredGroups.length})</h2>
+                
+                <div className="space-y-6">
+                    {filteredGroups.length === 0 ? (
+                        <div className="bg-gray-800 p-8 rounded-xl text-center text-gray-400 shadow-lg">
+                            No groups found matching your criteria. Be the first to add one!
+                        </div>
+                    ) : (
+                        filteredGroups.map((group) => (
+                            <div key={group.id} className="bg-gray-800 p-5 rounded-xl shadow-xl border-l-4 border-indigo-500 transition duration-300 hover:shadow-2xl hover:border-green-500">
+                                <div className="flex justify-between items-start mb-2">
+                                    <h3 className="text-xl font-bold text-gray-50">{group.category} Group / Channel}</h3> 
+                                    <div className="text-xs font-medium bg-yellow-400 text-gray-900 px-3 py-1 rounded-full shadow-md">
+                                        {group.country === 'Global' ? '🌍 Global' : '📍 Local'}
+                                    </div>
+                                </div>
+                                
+                                <div className="flex space-x-3 text-sm mb-3 text-gray-400">
+                                    <span className="flex items-center space-x-1">
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h1.5m10 0v5.5a2.5 2.5 0 01-2.5 2.5h-1.5m-14 4h10M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H5a2 2 0 00-2 2v5a2 2 0 002 2z" /></svg>
+                                        <span>{group.country}</span>
+                                    </span>
+                                    <span className="flex items-center space-x-1">
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 7h.01M7 3h10a2 2 0 012 2v14a2 2 0 01-2 2H7a2 2 0 01-2-2V5a2 2 0 012-2z" /></svg>
+                                        <span>{group.category}</span>
+                                    </span>
+                                </div>
+                                
+                                <p className="text-gray-300 mb-3 text-sm">{group.description || "No description provided for this group. Click 'Join' to check it out."}</p>
+                                
+                                <div className="flex flex-wrap gap-2 mb-4">
+                                    {group.tags && group.tags.map(tag => (
+                                        <span key={tag} className="text-xs bg-gray-700 text-gray-300 px-2 py-1 rounded-full font-medium">
+                                            #{tag}
+                                        </span>
+                                    ))}
+                                </div>
+
+                                {/* Action Buttons (Admin Only) */}
+                                <div className="flex gap-2">
+                                    {isAdmin && (
+                                        <>
+                                            <button 
+                                                onClick={() => handleEdit(group)}
+                                                className="flex-grow py-3 bg-indigo-600 text-white font-bold rounded-lg shadow-xl hover:bg-indigo-700 transition duration-150"
+                                            >
+                                                Edit
+                                            </button>
+                                            <button 
+                                                onClick={() => handleDelete(group.id)}
+                                                className="py-3 px-4 bg-red-600 text-white font-bold rounded-lg shadow-xl hover:bg-red-700 transition duration-150"
+                                            >
+                                                Delete
+                                            </button>
+                                        </>
+                                    )}
+                                    <a 
+                                        href={group.link} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer"
+                                        className={`block py-3 text-center text-white font-bold rounded-lg shadow-xl transition duration-150 transform hover:scale-[1.01] ${isAdmin ? 'flex-grow bg-green-500 hover:bg-green-600' : 'w-full bg-green-600 hover:bg-green-700'}`}
+                                    >
+                                        Join Group
+                                    </a>
+                                </div>
+                            </div>
+                        ))
+                    )}
+                </div>
+            </main>
+
+            {/* Floating Footer Button (Visible on small screens) */}
+            <div className="fixed bottom-0 left-0 right-0 p-4 bg-gray-900 border-t border-green-700 md:hidden z-40">
+                <button 
+                    onClick={() => { setIsModalOpen(true); setEditingGroup(null); }}
+                    className="w-full py-3 bg-green-600 text-white font-bold rounded-lg shadow-xl hover:bg-green-700 transition duration-200"
+                >
+                    + Add Group
+                </button>
+            </div>
+
+
+            {/* Modal for Group Submission (Handles Add and Edit) */}
+            <GroupFormModal 
+                db={db} 
+                userId={userId} 
+                publicCollectionPath={publicCollectionPath} 
+                onClose={handleModalClose} 
+                isVisible={isModalOpen} 
+                groupToEdit={editingGroup}
+            />
+        </div>
+    );
+};
+
+export default App;
